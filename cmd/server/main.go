@@ -145,27 +145,31 @@ var (
 	startTime      = time.Now()
 )
 
-// omniHandler: one handler to rule them all.
-// It routes, logs, renders, filters, calculates metrics, and serves JSON.
+// omniHandler: centralized router + controller
 func omniHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	path := r.URL.Path
-
-	begin := time.Now()
+	start := time.Now()
 	defer func() {
-		d := time.Since(begin)
+		// Log timing and last status after we handled the request
+		d := time.Since(start)
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, atomic.LoadInt32(&lastStatusCode), d)
 	}()
 
-	if path == "/health" {
-		atomic.StoreInt32(&lastStatusCode, http.StatusOK)
-		w.WriteHeader(http.StatusOK)
+	switch r.URL.Path {
+	case "/health":
+		writeStatus(w, http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 		return
-	}
-	if path == "/metrics" {
+
+	case "/metrics":
+		if !methodAllowed(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
+		writeStatus(w, http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
 		uptime := time.Since(startTime).Seconds()
-		atomic.StoreInt32(&lastStatusCode, http.StatusOK)
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		_, _ = w.Write([]byte(
 			"# HELP leaflove_requests_total Total HTTP requests.\n" +
@@ -175,20 +179,24 @@ func omniHandler(w http.ResponseWriter, r *http.Request) {
 				"# TYPE leaflove_uptime_seconds gauge\n" +
 				"leaflove_uptime_seconds " + strconv.FormatFloat(uptime, 'f', 0, 64) + "\n"))
 		return
-	}
 
-	// Homepage SSR.
-	if path == "/" && r.Method == http.MethodGet {
-		atomic.StoreInt32(&lastStatusCode, http.StatusOK)
+	case "/":
+		if !methodAllowed(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
+		writeStatus(w, http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
 		renderHTML(w, tplIndex, nil)
 		return
-	}
 
-	// HTML form submit → recommendations (business logic in handler).
-	if path == "/recommend" && r.Method == http.MethodPost {
+	case "/recommend":
+		if !methodAllowed(w, r, http.MethodPost) {
+			return
+		}
 		if err := r.ParseForm(); err != nil {
-			atomic.StoreInt32(&lastStatusCode, http.StatusBadRequest)
-			http.Error(w, "invalid form", http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid form: "+err.Error())
 			return
 		}
 		prefs := models.PlantPreferences{
@@ -198,19 +206,19 @@ func omniHandler(w http.ResponseWriter, r *http.Request) {
 			Location:       r.FormValue("location"),
 			Size:           r.FormValue("size"),
 		}
-
 		recs := filterPlants(prefs)
-
-		atomic.StoreInt32(&lastStatusCode, http.StatusOK)
+		writeStatus(w, http.StatusOK)
 		renderHTML(w, tplResults, map[string]any{
 			"Plants":      recs,
 			"Preferences": prefs,
 			"Count":       len(recs),
 		})
 		return
-	}
 
-	if path == "/api/recommend" && r.Method == http.MethodGet {
+	case "/api/recommend":
+		if !methodAllowed(w, r, http.MethodGet, http.MethodHead) {
+			return
+		}
 		q := r.URL.Query()
 		prefs := models.PlantPreferences{
 			LightCondition: q.Get("lightCondition"),
@@ -221,48 +229,107 @@ func omniHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		recs := filterPlants(prefs)
 
-		atomic.StoreInt32(&lastStatusCode, http.StatusOK)
+		// Basic caching hints (safe since results depend only on query)
+		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
+
+		writeStatus(w, http.StatusOK)
+		if r.Method == http.MethodHead {
+			return
+		}
 		_ = json.NewEncoder(w).Encode(recs)
 		return
 	}
 
-	// Fallback
-	atomic.StoreInt32(&lastStatusCode, http.StatusNotFound)
-	http.NotFound(w, r)
+	// Fallback 404
+	writeJSONError(w, http.StatusNotFound, "route not found")
 }
 
-// filterPlants: embeds business rules, sorting and helpers
-func filterPlants(p models.PlantPreferences) []models.Plant {
-	var out []models.Plant
-	for _, plant := range data.Plants {
-		lightMatch := contains(plant.LightCondition, p.LightCondition)
-		careMatch := p.CareLevel == "" || p.CareLevel == plant.CareLevel
-		typeMatch := p.PlantType == "" || p.PlantType == "any" || p.PlantType == plant.PlantType
-		locationMatch := p.Location == "" || p.Location == "both" || p.Location == plant.Location || plant.Location == "both"
-		sizeMatch := p.Size == "" || p.Size == "any" || p.Size == plant.Size
 
-		if lightMatch && careMatch && typeMatch && locationMatch && sizeMatch {
-			out = append(out, plant)
+// filterPlants orchestrates the matching + sorting.
+func filterPlants(p models.PlantPreferences) []models.Plant {
+	p = normalizePrefs(p)
+
+	var out []models.Plant
+	for _, pl := range data.Plants {
+		if matchesAll(pl, p) {
+			out = append(out, pl)
 		}
 	}
-	slices.SortFunc(out, func(a, b models.Plant) int { return strings.Compare(a.Name, b.Name) })
+	sortPlantsByName(out)
 	return out
 }
 
-func contains(list []string, val string) bool {
+// matchesAll checks if a plant matches all preferences.
+func matchesAll(pl models.Plant, p models.PlantPreferences) bool {
+	return matchesLight(pl, p) &&
+		matchesCare(pl, p) &&
+		matchesType(pl, p) &&
+		matchesLocation(pl, p) &&
+		matchesSize(pl, p)
+}
+
+func matchesLight(pl models.Plant, p models.PlantPreferences) bool {
+	if p.LightCondition == "" {
+		return true
+	}
+	return has(pl.LightCondition, p.LightCondition)
+}
+
+func matchesCare(pl models.Plant, p models.PlantPreferences) bool {
+	return p.CareLevel == "" || pl.CareLevel == p.CareLevel
+}
+
+func matchesType(pl models.Plant, p models.PlantPreferences) bool {
+	if p.PlantType == "" || p.PlantType == "any" {
+		return true
+	}
+	return pl.PlantType == p.PlantType
+}
+
+func matchesLocation(pl models.Plant, p models.PlantPreferences) bool {
+	if p.Location == "" || p.Location == "both" {
+		return true
+	}
+	// also match if the plant itself is usable in both locations
+	return pl.Location == p.Location || pl.Location == "both"
+}
+
+func matchesSize(pl models.Plant, p models.PlantPreferences) bool {
+	if p.Size == "" || p.Size == "any" {
+		return true
+	}
+	return pl.Size == p.Size
+}
+
+func sortPlantsByName(plants []models.Plant) {
+	slices.SortFunc(plants, func(a, b models.Plant) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+}
+
+func normalizePrefs(p models.PlantPreferences) models.PlantPreferences {
+	p.LightCondition = strings.ToLower(strings.TrimSpace(p.LightCondition))
+	p.CareLevel = strings.ToLower(strings.TrimSpace(p.CareLevel))
+	p.PlantType = strings.ToLower(strings.TrimSpace(p.PlantType))
+	p.Location = strings.ToLower(strings.TrimSpace(p.Location))
+	p.Size = strings.ToLower(strings.TrimSpace(p.Size))
+	return p
+}
+
+func has(list []string, val string) bool {
 	if val == "" {
 		return true
 	}
 	for _, x := range list {
-		if x == val {
+		if strings.EqualFold(strings.TrimSpace(x), val) {
 			return true
 		}
 	}
 	return false
 }
 
-// renderHTML: template composition owned by same package-level
+
 func renderHTML(w http.ResponseWriter, t *template.Template, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
@@ -286,14 +353,14 @@ func main() {
 	}
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err == nil {
-		log.SetOutput(f) 
+		log.SetOutput(f) // Redirect logs to file
 	} else {
 		log.Printf("failed to open log file %q: %v", logFile, err)
 	}
 
 	mux := http.NewServeMux()
 
-	// Static file serving configured here.
+	// Static file serving also configured here.
 	fs := http.FileServer(http.Dir("web/static"))
 	mux.Handle("/static/", http.StripPrefix("/static/", fs))
 
